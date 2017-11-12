@@ -15,9 +15,6 @@ Shader "Disintegrator"
         _Color2("Albedo", Color) = (0, 0, 0, 0)
         _Glossiness2("Smoothness", Range(0, 1)) = 0
         [Gamma] _Metallic2("Metallic", Range(0, 1)) = 0
-
-        [Header(Edge Properteis)]
-        [HDR] _EdgeColor("Color", Color) = (1, 0, 0)
     }
     SubShader
     {

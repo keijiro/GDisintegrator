@@ -4,7 +4,7 @@
 #include "Common.cginc"
 #include "UnityGBuffer.cginc"
 #include "UnityStandardUtils.cginc"
-#include "SimplexNoise3D.hlsl"
+#include "SimplexNoise2D.hlsl"
 
 // Cube map shadow caster; Used to render point light shadows on platforms
 // that lacks depth cube map support.
@@ -23,9 +23,6 @@ half _Metallic;
 half4 _Color2;
 half _Glossiness2;
 half _Metallic2;
-
-// Edge properties
-half3 _EdgeColor;
 
 // Dynamic properties
 float4 _EffectVector;
@@ -52,11 +49,10 @@ struct Varyings
 
 #else
     // GBuffer construction pass
-    float3 normal : NORMAL;
+    half3 normal : NORMAL;
     float2 texcoord : TEXCOORD0;
-    half3 ambient : TEXCOORD1;
-    float4 edge : TEXCOORD2; // barycentric coord (xyz), emission (w)
-    float4 wpos_ch : TEXCOORD3; // world position (xyz), channel select (w)
+    float3 worldPos : TEXCOORD1;
+    half4 ambient_ch : TEXCOORD2; // Ambient SH (xyz), channel select (w)
 
 #endif
 };
@@ -77,8 +73,9 @@ Attributes Vertex(Attributes input)
 // Geometry stage
 //
 
-Varyings VertexOutput(float3 wpos, half3 wnrm, float2 uv,
-                      float4 edge = 0.5, float channel = 0)
+#define POINTS_PER_RING 24
+
+Varyings VertexOutput(float3 wpos, half3 wnrm, float2 uv, half channel = 0)
 {
     Varyings o;
 
@@ -98,15 +95,19 @@ Varyings VertexOutput(float3 wpos, half3 wnrm, float2 uv,
     o.position = UnityWorldToClipPos(float4(wpos, 1));
     o.normal = wnrm;
     o.texcoord = uv;
-    o.ambient = ShadeSHPerVertex(wnrm, 0);
-    o.edge = edge;
-    o.wpos_ch = float4(wpos, channel);
+    o.worldPos = wpos;
+    o.ambient_ch = half4(ShadeSHPerVertex(wnrm, 0), channel);
 
 #endif
     return o;
 }
 
-[maxvertexcount(24)]
+float3 RingPoint(float3 tx, float3 ty, float phi, float2 np)
+{
+    return (cos(phi) * tx + sin(phi) * ty) * (1 + snoise(np) * 0.2);
+}
+
+[maxvertexcount(POINTS_PER_RING * 2)]
 void Geometry(
     triangle Attributes input[3], uint pid : SV_PrimitiveID,
     inout TriangleStream<Varyings> outStream
@@ -143,25 +144,51 @@ void Geometry(
     // Draw nothing at the end of deformation.
     if (param >= 1) return;
 
-    // Choose cube/triangle randomly.
+    // Choose ring/triangle randomly.
     uint seed = pid * 877;
-    if (Random(seed) < 0.08)
+    if (Random(seed) < 0.05)
     {
-        float3 ay = float3(0, 1, 0);
-        float3 az = normalize(n0 + n1 + n2);
-        float3 ax = normalize(cross(ay, az));
-        ay = normalize(cross(az, ax));
+        // Construct the tangent space
+        float3 tx = normalize(n0 + n1 + n2);
+        float3 ty = normalize(cross(RandomVector(seed + 1), tx));
+        float3 tz = normalize(cross(tx, ty));
 
-        float ss = smoothstep(0, 0.2, param) * smoothstep(0, 0.8, 1 - param);
+        // Ring width
+        float wid = 0.01;
+        wid *= smoothstep(0, 0.2, param);
+        wid *= smoothstep(0, 0.8, 1 - param);
 
-        float rnd = Random(seed + 900);
-        for (uint i = 0; i < 24; i++)
+        // Ring radius
+        float rad = (1 + Random(seed + 4)) * 0.1;
+        rad *= 1 - (1 - param) * (1 - param);
+
+        // Noise offset
+        float noffs = Random(seed + 5) * 3234.21 + param * 2;
+
+        // Base angle
+        float phi = Random(seed + 6) * UNITY_PI * 2;
+
+        // Loop parameters
+        float phi_di = UNITY_PI / POINTS_PER_RING;
+        float np_di = 0.05 + 0.2 * Random(seed + 7);
+
+        for (uint i = 0; i < POINTS_PER_RING; i++)
         {
-            float4 sns = snoise_grad(float3(rnd * 3234.21, i * 0.084 + param*2, param));
-            float phi = UNITY_PI * i / 24 + Random(seed + 2) * 6 + 0*Random(seed + 3) * 8 * param;
-            float3 n = cos(phi) * ax + sin(phi) * az + ay * 0.3 * ss * (i & 1) * Random(seed + 5);
-            //outStream.Append(GeoOutWPosNrm(center + n * 0.4 * (param + 0.1) * (1 + sns.w * 0.8) * Random(seed + 4), n));
-            outStream.Append(VertexOutput(center + n * 0.4 * (param + 0.1) * (1 + sns.w * 0.8) * Random(seed + 4), n, 0, 0.5, 1));
+            // Calculate three points to derive the gradient.
+            float3 p0 = RingPoint(tx, ty, phi + phi_di * (i - 0.1), float2(noffs, np_di * (i - 0.1)));
+            float3 p1 = RingPoint(tx, ty, phi + phi_di * (i      ), float2(noffs, np_di * (i      )));
+            float3 p2 = RingPoint(tx, ty, phi + phi_di * (i + 0.1), float2(noffs, np_di * (i - 0.1)));
+
+            // Position/normal
+            float3 pos = center + p1 * rad;
+            float3 nrm = normalize(cross(p2 - p0, tz));
+
+            // Ring width curve
+            float dz = wid * smoothstep(0, 0.8, 1 - abs(1 - i / 12.0));
+
+            // Vertex outputs
+            outStream.Append(VertexOutput(pos + tz * dz, nrm, 0, 1));
+            outStream.Append(VertexOutput(pos - tz * dz, nrm, 0, 1));
         }
 
         outStream.RestartStrip();
@@ -172,8 +199,6 @@ void Geometry(
         // Simple scattering animation
 
         // We use smoothstep to make naturally damped linear motion.
-        // Q. Why don't you use 1-pow(1-param,2)?
-        // A. Smoothstep is cooler than it. Forget Newtonian physics.
         float ss_param = smoothstep(0, 1, param);
 
         // Random motion
@@ -192,14 +217,10 @@ void Geometry(
         float3 t_p2 = mul(rot_m, p2 - center) * scale + center + move;
         float3 normal = normalize(cross(t_p1 - t_p0, t_p2 - t_p0));
 
-        // Edge color (emission power) animation
-        float edge = smoothstep(0, 0.1, param); // ease-in
-        edge *= 1 + 20 * smoothstep(0, 0.1, 0.1 - param); // peak -> release
-
-        // Vertex outputs (front face)
-        outStream.Append(VertexOutput(t_p0, normal, uv0, float4(1, 0, 0, edge), 1));
-        outStream.Append(VertexOutput(t_p1, normal, uv1, float4(0, 1, 0, edge), 1));
-        outStream.Append(VertexOutput(t_p2, normal, uv2, float4(0, 0, 1, edge), 1));
+        // Vertex outputs
+        outStream.Append(VertexOutput(t_p0, normal, uv0));
+        outStream.Append(VertexOutput(t_p1, normal, uv1));
+        outStream.Append(VertexOutput(t_p2, normal, uv2));
         outStream.RestartStrip();
     }
 }
@@ -227,6 +248,7 @@ half4 Fragment() : SV_Target { return 0; }
 // GBuffer construction pass
 void Fragment(
     Varyings input,
+    float vface : VFACE,
     out half4 outGBuffer0 : SV_Target0,
     out half4 outGBuffer1 : SV_Target1,
     out half4 outGBuffer2 : SV_Target2,
@@ -249,27 +271,19 @@ void Fragment(
         c2_spec, not_in_use      // output
     );
 
-    // Detect fixed-width edges with using screen space derivatives of
-    // barycentric coordinates.
-    float3 bcc = input.edge.xyz;
-    float3 fw = fwidth(bcc);
-    float3 edge3 = min(smoothstep(fw / 2, fw * 1.5,     bcc),
-                       smoothstep(fw / 2, fw * 1.5, 1 - bcc));
-    float edge = 1 - min(min(edge3.x, edge3.y), edge3.z);
-
     // Update the GBuffer.
     UnityStandardData data;
-    float ch = input.wpos_ch.w;
+    float ch = input.ambient_ch.w;
     data.diffuseColor = lerp(c1_diff, c2_diff, ch);
     data.occlusion = 1;
     data.specularColor = lerp(c1_spec, c2_spec, ch);
     data.smoothness = lerp(_Glossiness, _Glossiness2, ch);
-    data.normalWorld = input.normal;
+    data.normalWorld = (vface < 0 ? -1 : 1) * input.normal;
     UnityStandardDataToGbuffer(data, outGBuffer0, outGBuffer1, outGBuffer2);
 
     // Output ambient light and edge emission to the emission buffer.
-    half3 sh = ShadeSHPerPixel(data.normalWorld, input.ambient, input.wpos_ch.xyz);
-    outEmission = half4(sh * data.diffuseColor + _EdgeColor * input.edge.w * edge, 1);
+    half3 sh = ShadeSHPerPixel(data.normalWorld, input.ambient_ch.rgb, input.worldPos);
+    outEmission = half4(sh * data.diffuseColor, 1);
 }
 
 #endif
